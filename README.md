@@ -89,3 +89,104 @@ Your infrastructure is defined in `state.json`. The script supports two types of
     "state": "running"
   }
 ]
+```
+
+### Field Reference
+
+| **Field** | **Description** | **LXC Note** | **VM Note** |
+| --- | --- | --- | --- |
+| `type` | `lxc` or `vm` | Required | Required |
+| `vmid` | Unique ID | Proxmox ID | Proxmox ID |
+| `hostname` | System Name | Sets hostname | Sets VM Name |
+| `template` | Source Image | Path to `.tar.zst` | Path to `.iso` (CDROM) |
+| `memory` | RAM in MB | Dynamic | Dynamic |
+| `cores` | CPU Cores | Dynamic | Dynamic |
+| `storage` | Disk Config | Size in GB (e.g. `local-lvm:8`) | SCSI0 Size (e.g. `local-lvm:32`) |
+| `net0` | Network String | e.g. `name=eth0,bridge=vmbr0,ip=dhcp` | e.g. `virtio,bridge=vmbr0` |
+| `state` | Power State | `running` or `stopped` | `running` or `stopped` |
+
+* * * * *
+
+🛡️ Handling Foreign Workloads
+------------------------------
+
+If you create a VM manually (outside of this repo), the system will enter **Safe Mode**.
+
+1.  The next scheduled run will detect the unmanaged VM ID.
+
+2.  It will log a **WARN** event and **Abort** the deployment to prevent conflict.
+
+3.  **To Fix:** Check the logs for the "Suggested Import" block.
+
+Bash
+
+```
+tail -f /var/log/proxmox_dsc.log
+
+```
+
+**Output Example:**
+
+Plaintext
+
+```
+[WARN] FOREIGN vm DETECTED: VMID 105
+...
+--- SUGGESTED JSON IMPORT FOR VM 105 ---
+{
+  "type": "vm",
+  "vmid": 105,
+  "hostname": "test-vm",
+  ...
+}
+
+```
+
+1.  Copy this JSON block into your `state.json`, commit, and push.
+
+2.  The next run will detect the update, recognize the VM, and resume management.
+
+* * * * *
+
+📂 File Structure
+-----------------
+
+-   `setup.sh`: The installer. idempotent. Can be run repeatedly to update the installation.
+
+-   `proxmox_dsc.sh`: The core logic engine. Handles the `pct` and `qm` commands and reconciliation logic.
+
+-   `state.json`: The source of truth for your infrastructure.
+
+-   (Generated) `proxmox_wrapper.sh`: Created by setup.sh. Handles the git-update and dry-run logic before calling the DSC engine.
+
+📊 Logging & Troubleshooting
+----------------------------
+
+-   **Application Logs:**
+
+    Bash
+
+    ```
+    tail -f /var/log/proxmox_dsc.log
+
+    ```
+
+-   **Systemd Status:**
+
+    Bash
+
+    ```
+    systemctl status proxmox-iac.timer
+    systemctl status proxmox-iac.service
+
+    ```
+
+-   **System Journal (Debug):**
+
+    Bash
+
+    ```
+    journalctl -u proxmox-iac.service -f
+    ```
+
+
