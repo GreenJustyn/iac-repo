@@ -1,6 +1,6 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v3.2 - Fixes Race Condition)
+# Script: setup.sh (v3.3 - Fixes Git Loop & Race Conditions)
 # Description: GitOps Installer for Proxmox IaC.
 # -----------------------------------------------------------------------------
 
@@ -8,10 +8,11 @@ set -euo pipefail
 
 # --- Configuration ---
 INSTALL_DIR="/root/iac"
+# Capture the ACTUAL current directory where this repo lives
 REPO_DIR=$(pwd)
 SERVICE_NAME="proxmox-iac"
 
-echo ">>> Starting Proxmox IaC Installation..."
+echo ">>> Starting Proxmox IaC Installation (v3.3)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -20,97 +21,119 @@ command -v git >/dev/null 2>&1 || apt-get install -y git
 
 mkdir -p "$INSTALL_DIR"
 
-# 2. Kill Stale Processes & Remove Cron
-echo "--- Cleaning up old processes ---"
-# Check if cron is running the script and try to comment it out
+# 2. Cleanup Old Processes
 if crontab -l 2>/dev/null | grep -q "proxmox_dsc.sh"; then
-    echo "WARNING: Old Cron job detected. Removing..."
     crontab -l | grep -v "proxmox_dsc.sh" | crontab -
-    echo "Cron job removed."
 fi
-
-# Kill any currently running instances to clear the lock
 pkill -f "proxmox_dsc.sh" || true
+pkill -f "proxmox_wrapper.sh" || true
 rm -f /tmp/proxmox_dsc.lock
 
-# 3. Install Core Scripts
+# 3. Install Core Scripts (with Lock Fix)
 echo "--- Installing Scripts ---"
 
-# --- Injecting the Resilient Locking Logic directly into the installed script ---
-# We take the local file, but apply a sed replacement to fix the locking line
 if [ -f "proxmox_dsc.sh" ]; then
+    # Inject the "Wait 60s" lock fix into the destination file
     sed 's/flock -n 200/flock -w 60 200/g' proxmox_dsc.sh > "$INSTALL_DIR/proxmox_dsc.sh"
     chmod +x "$INSTALL_DIR/proxmox_dsc.sh"
 else
-    echo "ERROR: proxmox_dsc.sh not found!"
+    echo "ERROR: proxmox_dsc.sh not found in $REPO_DIR!"
     exit 1
 fi
 
-# Copy State
 if [ -f "state.json" ]; then
     cp state.json "$INSTALL_DIR/state.json"
 else
     echo "[]" > "$INSTALL_DIR/state.json"
 fi
 
-# 4. Generate Wrapper (Unchanged)
-cat << 'EOF' > "$INSTALL_DIR/proxmox_wrapper.sh"
+# 4. Generate Smart Wrapper
+# We inject the captured $REPO_DIR into the script
+cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 INSTALL_DIR="/root/iac"
-REPO_DIR="/root/iac-repo" # Ensure this matches your git clone path
-DSC_SCRIPT="$INSTALL_DIR/proxmox_dsc.sh"
-STATE_FILE="$INSTALL_DIR/state.json"
+REPO_DIR="$REPO_DIR" 
+DSC_SCRIPT="\$INSTALL_DIR/proxmox_dsc.sh"
+STATE_FILE="\$INSTALL_DIR/state.json"
 LOG_FILE="/var/log/proxmox_dsc.log"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] $1" | tee -a "$LOG_FILE"; }
+log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] \$1" | tee -a "\$LOG_FILE"; }
 
-# Git Auto-Update
-if [ -d "$REPO_DIR/.git" ]; then
-    cd "$REPO_DIR"
-    git fetch origin
-    LOCAL=$(git rev-parse HEAD)
-    REMOTE=$(git rev-parse @{u})
+# --- Step 1: Git Auto-Update (Loop Protected) ---
+if [ -d "\$REPO_DIR/.git" ]; then
+    cd "\$REPO_DIR"
+    
+    # Check remote only if network is up
+    if git fetch origin 2>/dev/null; then
+        LOCAL=\$(git rev-parse HEAD)
+        REMOTE=\$(git rev-parse @{u})
 
-    if [ "$LOCAL" != "$REMOTE" ]; then
-        log "Update detected. Pulling changes..."
-        git pull
-        log "Re-running setup.sh..."
-        chmod +x setup.sh
-        ./setup.sh
-        log "Restarting wrapper..."
-        exec "$0"
+        if [ "\$LOCAL" != "\$REMOTE" ]; then
+            log "Update detected. Attempting pull..."
+            
+            # Capture output and exit code
+            if ! output=\$(git pull 2>&1); then
+                log "ERROR: Git pull failed. Skipping update to prevent loop. Details: \$output"
+            else
+                # Verify we actually moved
+                NEW_LOCAL=\$(git rev-parse HEAD)
+                if [ "\$NEW_LOCAL" != "\$LOCAL" ]; then
+                    log "Git updated successfully (\$LOCAL -> \$NEW_LOCAL). Re-installing and Restarting..."
+                    
+                    # Run setup to apply changes
+                    if [ -f "./setup.sh" ]; then
+                        chmod +x ./setup.sh
+                        ./setup.sh
+                    fi
+                    
+                    # Restart wrapper process to use new code
+                    exec "\$0"
+                else
+                    log "WARN: Git pull succeeded but HEAD did not move. Continuing without restart."
+                fi
+            fi
+        fi
+    else
+        log "WARN: Unable to fetch from git remote. Skipping update check."
     fi
+else
+    log "WARN: No git repo found at \$REPO_DIR. Skipping update."
 fi
 
-# Dry Run
+# --- Step 2: Dry Run ---
 log "Starting Dry Run..."
-DRY_OUTPUT=$($DSC_SCRIPT --manifest "$STATE_FILE" --dry-run 2>&1)
-EXIT_CODE=$?
-FOREIGN_COUNT=$(echo "$DRY_OUTPUT" | grep -c "FOREIGN")
-ERROR_COUNT=$(echo "$DRY_OUTPUT" | grep -c "ERROR")
+# Run Dry Run, capturing both STDOUT and STDERR
+DRY_OUTPUT=\$("\$DSC_SCRIPT" --manifest "\$STATE_FILE" --dry-run 2>&1)
+EXIT_CODE=\$?
 
-if [ $EXIT_CODE -ne 0 ]; then
-    log "CRITICAL: Dry run failed (Exit Code $EXIT_CODE). Aborting."
-    echo "$DRY_OUTPUT" | tee -a "$LOG_FILE"
+FOREIGN_COUNT=\$(echo "\$DRY_OUTPUT" | grep -c "FOREIGN")
+ERROR_COUNT=\$(echo "\$DRY_OUTPUT" | grep -c "ERROR")
+
+# --- Step 3: Decision Logic ---
+if [ \$EXIT_CODE -ne 0 ]; then
+    log "CRITICAL: Dry run failed (Exit Code \$EXIT_CODE). Aborting."
+    echo "\$DRY_OUTPUT" | tee -a "\$LOG_FILE"
     exit 1
 fi
 
-if [ "$FOREIGN_COUNT" -gt 0 ]; then
-    log "BLOCK: Foreign workloads detected ($FOREIGN_COUNT). Aborting."
-    echo "$DRY_OUTPUT" | grep "FOREIGN" | tee -a "$LOG_FILE"
+if [ "\$FOREIGN_COUNT" -gt 0 ]; then
+    log "BLOCK: Foreign workloads detected (\$FOREIGN_COUNT). Aborting."
+    echo "\$DRY_OUTPUT" | grep "FOREIGN" | tee -a "\$LOG_FILE"
     exit 0
 fi
 
-if [ "$ERROR_COUNT" -gt 0 ]; then
+if [ "\$ERROR_COUNT" -gt 0 ]; then
     log "BLOCK: Errors detected. Aborting."
-    echo "$DRY_OUTPUT" | grep "ERROR" | tee -a "$LOG_FILE"
+    echo "\$DRY_OUTPUT" | grep "ERROR" | tee -a "\$LOG_FILE"
     exit 0
 fi
 
+# --- Step 4: Deployment ---
 log "Validation Passed. Deploying..."
-$DSC_SCRIPT --manifest "$STATE_FILE"
+"\$DSC_SCRIPT" --manifest "\$STATE_FILE"
 log "Workflow Complete."
 EOF
+
 chmod +x "$INSTALL_DIR/proxmox_wrapper.sh"
 
 # 5. Log Rotate & Systemd
@@ -155,4 +178,4 @@ EOF
 systemctl daemon-reload
 systemctl enable --now ${SERVICE_NAME}.timer
 
-echo ">>> Installation Complete. Locking logic updated to wait-mode."
+echo ">>> Installation Complete (v3.3). Loop protection enabled."
