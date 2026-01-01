@@ -1,7 +1,7 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v3.3 - Fixes Git Loop & Race Conditions)
-# Description: GitOps Installer for Proxmox IaC.
+# Script: setup.sh (v4.0 - Wrapper & Auto-Updater)
+# Description: GitOps Installer for Proxmox IaC + Host Auto-Updates
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -10,9 +10,10 @@ set -euo pipefail
 INSTALL_DIR="/root/iac"
 # Capture the ACTUAL current directory where this repo lives
 REPO_DIR=$(pwd)
-SERVICE_NAME="proxmox-iac"
+SERVICE_IAC="proxmox-iac"
+SERVICE_UPDATE="proxmox-autoupdate"
 
-echo ">>> Starting Proxmox IaC Installation (v3.3)..."
+echo ">>> Starting Proxmox Installation (v4.0)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -22,33 +23,39 @@ command -v git >/dev/null 2>&1 || apt-get install -y git
 mkdir -p "$INSTALL_DIR"
 
 # 2. Cleanup Old Processes
-if crontab -l 2>/dev/null | grep -q "proxmox_dsc.sh"; then
-    crontab -l | grep -v "proxmox_dsc.sh" | crontab -
-fi
 pkill -f "proxmox_dsc.sh" || true
 pkill -f "proxmox_wrapper.sh" || true
 rm -f /tmp/proxmox_dsc.lock
 
-# 3. Install Core Scripts (with Lock Fix)
-echo "--- Installing Scripts ---"
+# 3. Install Scripts
+echo "--- Installing Core Scripts ---"
 
+# A) Install DSC Script (with Lock Fix)
 if [ -f "proxmox_dsc.sh" ]; then
-    # Inject the "Wait 60s" lock fix into the destination file
     sed 's/flock -n 200/flock -w 60 200/g' proxmox_dsc.sh > "$INSTALL_DIR/proxmox_dsc.sh"
     chmod +x "$INSTALL_DIR/proxmox_dsc.sh"
 else
-    echo "ERROR: proxmox_dsc.sh not found in $REPO_DIR!"
+    echo "ERROR: proxmox_dsc.sh not found!"
     exit 1
 fi
 
+# B) Install Auto-Update Script
+if [ -f "proxmox_autoupdate.sh" ]; then
+    cp proxmox_autoupdate.sh "$INSTALL_DIR/proxmox_autoupdate.sh"
+    chmod +x "$INSTALL_DIR/proxmox_autoupdate.sh"
+else
+    echo "ERROR: proxmox_autoupdate.sh not found!"
+    exit 1
+fi
+
+# C) Install State File
 if [ -f "state.json" ]; then
     cp state.json "$INSTALL_DIR/state.json"
 else
     echo "[]" > "$INSTALL_DIR/state.json"
 fi
 
-# 4. Generate Smart Wrapper
-# We inject the captured $REPO_DIR into the script
+# 4. Generate Smart Wrapper (For IaC Workflow)
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 INSTALL_DIR="/root/iac"
@@ -59,86 +66,57 @@ LOG_FILE="/var/log/proxmox_dsc.log"
 
 log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] \$1" | tee -a "\$LOG_FILE"; }
 
-# --- Step 1: Git Auto-Update (Loop Protected) ---
+# Git Auto-Update Logic
 if [ -d "\$REPO_DIR/.git" ]; then
     cd "\$REPO_DIR"
-    
-    # Check remote only if network is up
     if git fetch origin 2>/dev/null; then
         LOCAL=\$(git rev-parse HEAD)
         REMOTE=\$(git rev-parse @{u})
-
         if [ "\$LOCAL" != "\$REMOTE" ]; then
-            log "Update detected. Attempting pull..."
-            
-            # Capture output and exit code
+            log "Update detected. Pulling..."
             if ! output=\$(git pull 2>&1); then
-                log "ERROR: Git pull failed. Skipping update to prevent loop. Details: \$output"
+                log "ERROR: Git pull failed. \$output"
             else
-                # Verify we actually moved
-                NEW_LOCAL=\$(git rev-parse HEAD)
-                if [ "\$NEW_LOCAL" != "\$LOCAL" ]; then
-                    log "Git updated successfully (\$LOCAL -> \$NEW_LOCAL). Re-installing and Restarting..."
-                    
-                    # Run setup to apply changes
-                    if [ -f "./setup.sh" ]; then
-                        chmod +x ./setup.sh
-                        ./setup.sh
-                    fi
-                    
-                    # Restart wrapper process to use new code
+                if [ "\$(git rev-parse HEAD)" != "\$LOCAL" ]; then
+                    log "Git updated. Re-installing..."
+                    [ -f "./setup.sh" ] && chmod +x ./setup.sh && ./setup.sh
                     exec "\$0"
-                else
-                    log "WARN: Git pull succeeded but HEAD did not move. Continuing without restart."
                 fi
             fi
         fi
-    else
-        log "WARN: Unable to fetch from git remote. Skipping update check."
     fi
-else
-    log "WARN: No git repo found at \$REPO_DIR. Skipping update."
 fi
 
-# --- Step 2: Dry Run ---
-log "Starting Dry Run..."
-# Run Dry Run, capturing both STDOUT and STDERR
+# Validation & Deployment
 DRY_OUTPUT=\$("\$DSC_SCRIPT" --manifest "\$STATE_FILE" --dry-run 2>&1)
 EXIT_CODE=\$?
 
-FOREIGN_COUNT=\$(echo "\$DRY_OUTPUT" | grep -c "FOREIGN")
-ERROR_COUNT=\$(echo "\$DRY_OUTPUT" | grep -c "ERROR")
-
-# --- Step 3: Decision Logic ---
 if [ \$EXIT_CODE -ne 0 ]; then
-    log "CRITICAL: Dry run failed (Exit Code \$EXIT_CODE). Aborting."
-    echo "\$DRY_OUTPUT" | tee -a "\$LOG_FILE"
+    log "CRITICAL: Dry run failed. Aborting."
     exit 1
 fi
 
-if [ "\$FOREIGN_COUNT" -gt 0 ]; then
-    log "BLOCK: Foreign workloads detected (\$FOREIGN_COUNT). Aborting."
+if echo "\$DRY_OUTPUT" | grep -q "FOREIGN"; then
+    log "BLOCK: Foreign workloads detected. Aborting."
     echo "\$DRY_OUTPUT" | grep "FOREIGN" | tee -a "\$LOG_FILE"
     exit 0
 fi
 
-if [ "\$ERROR_COUNT" -gt 0 ]; then
+if echo "\$DRY_OUTPUT" | grep -q "ERROR"; then
     log "BLOCK: Errors detected. Aborting."
-    echo "\$DRY_OUTPUT" | grep "ERROR" | tee -a "\$LOG_FILE"
     exit 0
 fi
 
-# --- Step 4: Deployment ---
-log "Validation Passed. Deploying..."
+log "Deploying..."
 "\$DSC_SCRIPT" --manifest "\$STATE_FILE"
-log "Workflow Complete."
 EOF
 
 chmod +x "$INSTALL_DIR/proxmox_wrapper.sh"
 
-# 5. Log Rotate & Systemd
-cat <<EOF > /etc/logrotate.d/proxmox_dsc
-/var/log/proxmox_dsc.log {
+# 5. Log Rotation (Combined)
+cat <<EOF > /etc/logrotate.d/proxmox_iac
+/var/log/proxmox_dsc.log 
+/var/log/proxmox_autoupdate.log {
     daily
     rotate 7
     compress
@@ -150,7 +128,12 @@ cat <<EOF > /etc/logrotate.d/proxmox_dsc
 }
 EOF
 
-cat <<EOF > /etc/systemd/system/${SERVICE_NAME}.service
+# 6. Systemd Units
+
+echo "--- Installing Systemd Units ---"
+
+# --- Unit 1: IaC (Existing) ---
+cat <<EOF > /etc/systemd/system/${SERVICE_IAC}.service
 [Unit]
 Description=Proxmox IaC GitOps Workflow
 After=network.target local-fs.target
@@ -162,7 +145,7 @@ User=root
 Nice=10
 EOF
 
-cat <<EOF > /etc/systemd/system/${SERVICE_NAME}.timer
+cat <<EOF > /etc/systemd/system/${SERVICE_IAC}.timer
 [Unit]
 Description=Run Proxmox IaC Workflow every 2 minutes
 
@@ -174,8 +157,37 @@ OnUnitActiveSec=2min
 WantedBy=timers.target
 EOF
 
-# 6. Activation
-systemctl daemon-reload
-systemctl enable --now ${SERVICE_NAME}.timer
+# --- Unit 2: Auto-Update (New) ---
+cat <<EOF > /etc/systemd/system/${SERVICE_UPDATE}.service
+[Unit]
+Description=Proxmox Host Auto-Update and Reboot
+After=network.target local-fs.target
 
-echo ">>> Installation Complete (v3.3). Loop protection enabled."
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/proxmox_autoupdate.sh
+User=root
+EOF
+
+cat <<EOF > /etc/systemd/system/${SERVICE_UPDATE}.timer
+[Unit]
+Description=Run Proxmox Host Update (Weekly)
+
+[Timer]
+# Run every Sunday at 04:00 AM
+OnCalendar=Sun 04:00
+# Ensure it doesn't run immediately on boot if missed, to prevent reboot loops
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# 7. Activation
+systemctl daemon-reload
+systemctl enable --now ${SERVICE_IAC}.timer
+systemctl enable --now ${SERVICE_UPDATE}.timer
+
+echo ">>> Installation Complete (v4.0)."
+echo "    IaC Timer:    Every 2 minutes"
+echo "    Update Timer: Sunday at 04:00 AM"
