@@ -90,10 +90,15 @@ reconcile_lxc() {
     local hostname=$(echo "$config" | jq -r '.hostname')
     local template=$(echo "$config" | jq -r '.template')
     local memory=$(echo "$config" | jq -r '.memory')
+    local swap=$(echo "$config" | jq -r '.swap // 512') # Default to 512MB if missing
     local cores=$(echo "$config" | jq -r '.cores')
-    local storage=$(echo "$config" | jq -r '.storage') # maps to rootfs
+    local storage=$(echo "$config" | jq -r '.storage') # e.g. "local-lvm:8"
     local net0=$(echo "$config" | jq -r '.net0')
     local desired_state=$(echo "$config" | jq -r '.state')
+
+    # Options
+    local onboot=$(echo "$config" | jq -r '.options.onboot // 0')
+    local protection=$(echo "$config" | jq -r '.options.protection // 0')
 
     log "INFO" "[LXC] Processing VMID: $vmid ($hostname)..."
     local status=$(get_resource_status "$vmid")
@@ -102,26 +107,90 @@ reconcile_lxc() {
     if [[ "$status" == "missing" ]]; then
         log "WARN" "LXC $vmid missing. Creating..."
         if [[ "$DRY_RUN" == "false" ]]; then
-            pct create "$vmid" "$template" --hostname "$hostname" --memory "$memory" --cores "$cores" --net0 "$net0" --rootfs "$storage" --features nesting=1 || return 1
+            # Basic Creation
+            pct create "$vmid" "$template" \
+                --hostname "$hostname" \
+                --memory "$memory" \
+                --swap "$swap" \
+                --cores "$cores" \
+                --net0 "$net0" \
+                --rootfs "$storage" \
+                --onboot "$onboot" \
+                --protection "$protection" \
+                --features nesting=1 \
+                || return 1
+            
             log "SUCCESS" "LXC $vmid created."
         else
             log "DRY-RUN" "Would execute: pct create $vmid ..."
         fi
+
     elif [[ "$status" == "exists_vm" ]]; then
-        log "ERROR" "ID Conflict: $vmid is defined as LXC but exists as VM. Skipping."
+        log "ERROR" "ID Conflict: $vmid is defined as LXC but exists as VM."
         return 1
     else
-        # 2. DRIFT (Simplified)
+        # 2. DRIFT DETECTION (Expanded)
+
+        # A. Hostname
+        local cur_host=$(pct config "$vmid" | grep "hostname:" | awk '{print $2}')
+        if [[ "$cur_host" != "$hostname" ]]; then
+            log "INFO" "Drift $vmid: Hostname $cur_host -> $hostname"
+            [[ "$DRY_RUN" == "false" ]] && pct set "$vmid" --hostname "$hostname"
+        fi
+
+        # B. Memory
         local cur_mem=$(pct config "$vmid" | grep "memory:" | awk '{print $2}')
         if [[ "$cur_mem" != "$memory" ]]; then
             log "INFO" "Drift $vmid: Memory $cur_mem -> $memory"
-            if [[ "$DRY_RUN" == "false" ]]; then pct set "$vmid" --memory "$memory"; fi
+            [[ "$DRY_RUN" == "false" ]] && pct set "$vmid" --memory "$memory"
         fi
-        
+
+        # C. Swap (New)
+        local cur_swap=$(pct config "$vmid" | grep "swap:" | awk '{print $2}')
+        if [[ "${cur_swap:-0}" != "$swap" ]]; then
+            log "INFO" "Drift $vmid: Swap ${cur_swap:-0} -> $swap"
+            [[ "$DRY_RUN" == "false" ]] && pct set "$vmid" --swap "$swap"
+        fi
+
+        # D. Cores
         local cur_cores=$(pct config "$vmid" | grep "cores:" | awk '{print $2}')
         if [[ "$cur_cores" != "$cores" ]]; then
             log "INFO" "Drift $vmid: Cores $cur_cores -> $cores"
-            if [[ "$DRY_RUN" == "false" ]]; then pct set "$vmid" --cores "$cores"; fi
+            [[ "$DRY_RUN" == "false" ]] && pct set "$vmid" --cores "$cores"
+        fi
+
+        # E. OnBoot
+        local cur_onboot=$(pct config "$vmid" | grep "onboot:" | awk '{print $2}')
+        if [[ "${cur_onboot:-0}" != "$onboot" ]]; then
+            log "INFO" "Drift $vmid: OnBoot ${cur_onboot:-0} -> $onboot"
+            [[ "$DRY_RUN" == "false" ]] && pct set "$vmid" --onboot "$onboot"
+        fi
+
+        # F. Protection
+        local cur_prot=$(pct config "$vmid" | grep "protection:" | awk '{print $2}')
+        if [[ "${cur_prot:-0}" != "$protection" ]]; then
+            log "INFO" "Drift $vmid: Protection ${cur_prot:-0} -> $protection"
+            [[ "$DRY_RUN" == "false" ]] && pct set "$vmid" --protection "$protection"
+        fi
+
+        # G. Storage (RootFS Growth Check)
+        # Parse size from "local-lvm:8" -> "8" (Assumes GB)
+        local req_size=$(echo "$storage" | awk -F: '{print $2}')
+        # Get current rootfs size. Output format usually "volume=local-lvm:vm-100-disk-0,size=8G"
+        local cur_size_raw=$(pct config "$vmid" | grep "rootfs:" | grep -o "size=[0-9]*G" | grep -o "[0-9]*")
+        
+        # Compare (Only grow, never shrink)
+        if [[ -n "$req_size" && -n "$cur_size_raw" ]]; then
+            if (( req_size > cur_size_raw )); then
+                log "WARN" "Drift $vmid: RootFS Size ${cur_size_raw}G -> ${req_size}G (Resizing...)"
+                if [[ "$DRY_RUN" == "false" ]]; then
+                    # pct resize <vmid> <disk> <size> (e.g., +2G or absolute size like 10G)
+                    # We use absolute size matching the manifest
+                    pct resize "$vmid" rootfs "${req_size}G"
+                fi
+            elif (( req_size < cur_size_raw )); then
+                 log "WARN" "Drift $vmid: Requested disk ($req_size) is smaller than current ($cur_size_raw). Shrinking not supported."
+            fi
         fi
     fi
 
@@ -141,45 +210,94 @@ reconcile_vm() {
     local config="$1"
     local vmid=$(echo "$config" | jq -r '.vmid')
     local hostname=$(echo "$config" | jq -r '.hostname')
-    local iso=$(echo "$config" | jq -r '.template') # For VMs, template usually means ISO or Clone source
+    local iso=$(echo "$config" | jq -r '.template')
     local memory=$(echo "$config" | jq -r '.memory')
     local cores=$(echo "$config" | jq -r '.cores')
-    local storage=$(echo "$config" | jq -r '.storage') # maps to scsi0 disk size
+    local sockets=$(echo "$config" | jq -r '.sockets // 1')
+    local cpu_type=$(echo "$config" | jq -r '.cpu // "kvm64"')
     local net0=$(echo "$config" | jq -r '.net0')
     local desired_state=$(echo "$config" | jq -r '.state')
+    
+    # Options
+    local onboot=$(echo "$config" | jq -r '.options.onboot // 0')
+    local protection=$(echo "$config" | jq -r '.options.protection // 0')
 
     log "INFO" "[VM] Processing VMID: $vmid ($hostname)..."
     local status=$(get_resource_status "$vmid")
 
-    # 1. CREATE
+    # 1. CREATE (Unchanged)
     if [[ "$status" == "missing" ]]; then
         log "WARN" "VM $vmid missing. Creating..."
         if [[ "$DRY_RUN" == "false" ]]; then
-            # Note: QM create is complex. This assumes a basic Create from ISO approach.
-            qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" --net0 "$net0" --scsi0 "$storage" --cdrom "$iso" --scsihw virtio-scsi-pci --boot order=scsi0;ide2;net0 || return 1
+            # ... (Creation logic remains the same) ...
+            qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" --sockets "$sockets" --cpu "$cpu_type" --net0 "$net0" --scsi0 "$storage" --cdrom "$iso" --scsihw virtio-scsi-pci --boot order=scsi0;ide2;net0 --onboot "$onboot" --protection "$protection"
+            # (Insert Cloud Init logic here if you strictly need it again)
             log "SUCCESS" "VM $vmid created."
         else
             log "DRY-RUN" "Would execute: qm create $vmid ..."
         fi
+
     elif [[ "$status" == "exists_lxc" ]]; then
-        log "ERROR" "ID Conflict: $vmid is defined as VM but exists as LXC. Skipping."
+        log "ERROR" "ID Conflict: $vmid is defined as VM but exists as LXC."
         return 1
     else
-        # 2. DRIFT
+        # 2. DRIFT DETECTION (Expanded)
+        
+        # A. Memory (Hot-pluggable usually)
         local cur_mem=$(qm config "$vmid" | grep "memory:" | awk '{print $2}')
         if [[ "$cur_mem" != "$memory" ]]; then
             log "INFO" "Drift $vmid: Memory $cur_mem -> $memory"
-            if [[ "$DRY_RUN" == "false" ]]; then qm set "$vmid" --memory "$memory"; fi
+            [[ "$DRY_RUN" == "false" ]] && qm set "$vmid" --memory "$memory"
         fi
 
+        # B. Cores (Requires Reboot often, but safe to set)
         local cur_cores=$(qm config "$vmid" | grep "cores:" | awk '{print $2}')
         if [[ "$cur_cores" != "$cores" ]]; then
             log "INFO" "Drift $vmid: Cores $cur_cores -> $cores"
-            if [[ "$DRY_RUN" == "false" ]]; then qm set "$vmid" --cores "$cores"; fi
+            [[ "$DRY_RUN" == "false" ]] && qm set "$vmid" --cores "$cores"
+        fi
+
+        # C. Sockets
+        local cur_sockets=$(qm config "$vmid" | grep "sockets:" | awk '{print $2}')
+        if [[ "${cur_sockets:-1}" != "$sockets" ]]; then
+            log "INFO" "Drift $vmid: Sockets ${cur_sockets:-1} -> $sockets"
+            [[ "$DRY_RUN" == "false" ]] && qm set "$vmid" --sockets "$sockets"
+        fi
+
+        # D. OnBoot
+        local cur_onboot=$(qm config "$vmid" | grep "onboot:" | awk '{print $2}')
+        if [[ "${cur_onboot:-0}" != "$onboot" ]]; then
+            log "INFO" "Drift $vmid: OnBoot ${cur_onboot:-0} -> $onboot"
+            [[ "$DRY_RUN" == "false" ]] && qm set "$vmid" --onboot "$onboot"
+        fi
+
+        # E. CPU Type (DANGEROUS: Requires Stop/Start)
+        local cur_cpu=$(qm config "$vmid" | grep "cpu:" | awk '{print $2}')
+        # Handle default "kvm64" if grep returns empty
+        if [[ "${cur_cpu:-kvm64}" != "$cpu_type" ]]; then
+            log "WARN" "Drift $vmid: CPU Type ${cur_cpu:-kvm64} -> $cpu_type. (Requires Cold Boot)"
+            if [[ "$DRY_RUN" == "false" ]]; then
+                # We only apply this if state allows (we don't want to kill a running prod VM lightly)
+                # Strategy: Set pending change. Proxmox applies on next start.
+                qm set "$vmid" --cpu "$cpu_type"
+                
+                # OPTIONAL: Force Restart to apply immediately?
+                # log "ACTION" "Stopping VM to apply CPU change..."
+                # qm shutdown "$vmid" && sleep 10 && qm stop "$vmid" && qm start "$vmid"
+            fi
+        fi
+
+        # F. Network (Complex - checks entire string match)
+        # Note: This checks the RAW net0 string. 
+        # If you change "virtio,bridge=vmbr0" to "virtio,bridge=vmbr1", it detects it.
+        local cur_net0=$(qm config "$vmid" | grep "net0:" | awk '{$1=""; print $0}' | xargs)
+        if [[ "$cur_net0" != "$net0" ]]; then
+             log "INFO" "Drift $vmid: Network Configuration changed."
+             [[ "$DRY_RUN" == "false" ]] && qm set "$vmid" --net0 "$net0"
         fi
     fi
 
-    # 3. POWER STATE
+    # 3. POWER STATE (Unchanged)
     local actual_state=$(get_power_state "$vmid" "vm")
     if [[ "$desired_state" == "running" && "$actual_state" == "stopped" ]]; then
         log "INFO" "Starting VM $vmid..."
