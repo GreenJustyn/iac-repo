@@ -1,7 +1,7 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v5.0 - The Full Stack)
-# Description: Installs IaC Wrapper, Host Auto-Update, and LXC Auto-Update.
+# Script: setup.sh (v6.0 - Full Stack + ISO Manager)
+# Description: Installs IaC Wrapper, Host Update, LXC Update, and ISO Manager.
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -14,31 +14,32 @@ REPO_DIR=$(pwd)
 SVC_IAC="proxmox-iac"
 SVC_HOST_UP="proxmox-autoupdate"
 SVC_LXC_UP="proxmox-lxc-autoupdate"
+SVC_ISO="proxmox-iso-sync"
 
-echo ">>> Starting Proxmox Installation (v5.0)..."
+echo ">>> Starting Proxmox Installation (v6.0)..."
 
 # 1. Dependency Check
 apt-get update -qq
 command -v jq >/dev/null 2>&1 || apt-get install -y jq
 command -v git >/dev/null 2>&1 || apt-get install -y git
+command -v wget >/dev/null 2>&1 || apt-get install -y wget
 
 mkdir -p "$INSTALL_DIR"
 
-# 2. Cleanup Old Processes/Locks
+# 2. Cleanup Old Processes
 pkill -f "proxmox_dsc.sh" || true
 pkill -f "proxmox_wrapper.sh" || true
 pkill -f "proxmox_autoupdate.sh" || true
 pkill -f "proxmox_lxc_autoupdate.sh" || true
+pkill -f "proxmox_iso_sync.sh" || true
 rm -f /tmp/proxmox_dsc.lock
 
 # 3. Install Scripts
 echo "--- Installing Scripts ---"
 
-# Helper to copy and chmod
 install_script() {
     local file=$1
     if [ -f "$file" ]; then
-        # Special handling for DSC to inject lock fix if needed
         if [ "$file" == "proxmox_dsc.sh" ]; then
             sed 's/flock -n 200/flock -w 60 200/g' "$file" > "$INSTALL_DIR/$file"
         else
@@ -55,13 +56,11 @@ install_script() {
 install_script "proxmox_dsc.sh"
 install_script "proxmox_autoupdate.sh"
 install_script "proxmox_lxc_autoupdate.sh"
+install_script "proxmox_iso_sync.sh"
 
-# Install State File
-if [ -f "state.json" ]; then
-    cp state.json "$INSTALL_DIR/state.json"
-else
-    echo "[]" > "$INSTALL_DIR/state.json"
-fi
+# Install Config Files
+if [ -f "state.json" ]; then cp state.json "$INSTALL_DIR/state.json"; else echo "[]" > "$INSTALL_DIR/state.json"; fi
+if [ -f "iso-images.json" ]; then cp iso-images.json "$INSTALL_DIR/iso-images.json"; else echo "[]" > "$INSTALL_DIR/iso-images.json"; fi
 
 # 4. Generate Wrapper (IaC)
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
@@ -103,13 +102,11 @@ if [ \$EXIT_CODE -ne 0 ]; then
     log "CRITICAL: Dry run failed. Aborting."
     exit 1
 fi
-
 if echo "\$DRY_OUTPUT" | grep -q "FOREIGN"; then
     log "BLOCK: Foreign workloads detected. Aborting."
     echo "\$DRY_OUTPUT" | grep "FOREIGN" | tee -a "\$LOG_FILE"
     exit 0
 fi
-
 if echo "\$DRY_OUTPUT" | grep -q "ERROR"; then
     log "BLOCK: Errors detected. Aborting."
     exit 0
@@ -124,7 +121,8 @@ chmod +x "$INSTALL_DIR/proxmox_wrapper.sh"
 cat <<EOF > /etc/logrotate.d/proxmox_iac
 /var/log/proxmox_dsc.log 
 /var/log/proxmox_autoupdate.log
-/var/log/proxmox_lxc_autoupdate.log {
+/var/log/proxmox_lxc_autoupdate.log
+/var/log/proxmox_iso_sync.log {
     daily
     rotate 7
     compress
@@ -139,7 +137,7 @@ EOF
 # 6. Systemd Units
 echo "--- Installing Systemd Units ---"
 
-# A) IaC Service (Runs via Wrapper)
+# A) IaC Service
 cat <<EOF > /etc/systemd/system/${SVC_IAC}.service
 [Unit]
 Description=Proxmox IaC GitOps Workflow
@@ -212,13 +210,39 @@ Persistent=false
 WantedBy=timers.target
 EOF
 
+# D) ISO Sync (New)
+cat <<EOF > /etc/systemd/system/${SVC_ISO}.service
+[Unit]
+Description=Proxmox ISO State Reconciliation
+After=network.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/proxmox_iso_sync.sh
+User=root
+EOF
+
+cat <<EOF > /etc/systemd/system/${SVC_ISO}.timer
+[Unit]
+Description=Run ISO Sync (Daily 02:00)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # 7. Activation
 systemctl daemon-reload
 systemctl enable --now ${SVC_IAC}.timer
 systemctl enable --now ${SVC_HOST_UP}.timer
 systemctl enable --now ${SVC_LXC_UP}.timer
+systemctl enable --now ${SVC_ISO}.timer
 
-echo ">>> Installation Complete (v5.0)."
+echo ">>> Installation Complete (v6.0)."
 echo "    IaC Timer:         Every 2 minutes"
 echo "    LXC Update Timer:  Sunday 01:00"
+echo "    ISO Sync Timer:    Daily 02:00"
 echo "    Host Update Timer: Sunday 04:00"

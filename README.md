@@ -177,6 +177,48 @@ Plaintext
 
 * * * * *
 
+💿 ISO Lifecycle Management
+---------------------------
+
+This node enforces **Strict State Reconciliation** for ISO images stored in the local Proxmox storage. It ensures that only the ISOs defined in your configuration exist on the disk, saving space and ensuring version compliance.
+
+### The Workflow
+1.  **Read Manifest:** The service reads `iso-images.json`.
+2.  **Download:** If a file listed in the JSON is missing from the disk, it is downloaded immediately.
+3.  **Cleanup:** If a file exists on the disk but is **NOT** in the JSON, it is detected as "Obsolete" and **Deleted**.
+
+### Configuration (`iso-images.json`)
+
+Manage your ISOs by editing this file. To update an OS version, simply change the `filename` and `url`. The script will download the new one and delete the old one automatically.
+
+JSON
+
+```
+[
+  {
+    "os": "Debian",
+    "version": "12.2",
+    "filename": "debian-12.2.0-amd64-netinst.iso",
+    "url": "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.2.0-amd64-netinst.iso"
+  },
+  {
+    "os": "Ubuntu",
+    "version": "22.04",
+    "filename": "ubuntu-22.04.3-live-server-amd64.iso",
+    "url": "https://releases.ubuntu.com/jammy/ubuntu-22.04.3-live-server-amd64.iso"
+  }
+]
+
+```
+### Schedule
+-   **Service:** `proxmox-iso-sync.service`
+-   **Schedule:** Runs Daily at **02:00 AM**.
+-   **Log File:** `/var/log/proxmox_iso_sync.log`
+
+### Storage Location
+
+The script automatically detects the path for the storage named `local` (typically `/var/lib/vz/template/iso`). If you use a different storage ID for ISOs, edit the `STORAGE_ID` variable in `proxmox_iso_sync.sh`.
+
 ## 📂 Repository Structure
 -----------------------
 
@@ -184,9 +226,11 @@ Plaintext
 | --- | --- |
 | `setup.sh` | The installer. Deploys everything. |
 | `state.json` | The Infrastructure Manifest. |
+| `iso-images.json` | The ISO Manifest. |
 | `proxmox_dsc.sh` | The Core IaC Engine (Logic for `pct` and `qm`). |
 | `proxmox_autoupdate.sh` | Host OS Update & Reboot script. |
 | `proxmox_lxc_autoupdate.sh` | LXC Container Patching script. |
+| `proxmox_iso_sync.sh` | ISO State Reconciliation script. |
 
 ## 📊 Logging & Troubleshooting
 ----------------------------
