@@ -1,6 +1,6 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v6.0 - Full Stack + ISO Manager)
+# Script: setup.sh (v6.1 - Robust Re-Install)
 # Description: Installs IaC Wrapper, Host Update, LXC Update, and ISO Manager.
 # -----------------------------------------------------------------------------
 
@@ -16,7 +16,7 @@ SVC_HOST_UP="proxmox-autoupdate"
 SVC_LXC_UP="proxmox-lxc-autoupdate"
 SVC_ISO="proxmox-iso-sync"
 
-echo ">>> Starting Proxmox Installation (v6.0)..."
+echo ">>> Starting Proxmox Installation (v6.1)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -62,7 +62,7 @@ install_script "proxmox_iso_sync.sh"
 if [ -f "state.json" ]; then cp state.json "$INSTALL_DIR/state.json"; else echo "[]" > "$INSTALL_DIR/state.json"; fi
 if [ -f "iso-images.json" ]; then cp iso-images.json "$INSTALL_DIR/iso-images.json"; else echo "[]" > "$INSTALL_DIR/iso-images.json"; fi
 
-# 4. Generate Wrapper (IaC)
+# 4. Generate Wrapper (IaC) - UPDATED LOGIC HERE
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 INSTALL_DIR="/root/iac"
@@ -73,28 +73,43 @@ LOG_FILE="/var/log/proxmox_dsc.log"
 
 log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] \$1" | tee -a "\$LOG_FILE"; }
 
-# Git Auto-Update
+# Git Auto-Update Logic
 if [ -d "\$REPO_DIR/.git" ]; then
     cd "\$REPO_DIR"
+    # Fetch updates
     if git fetch origin 2>/dev/null; then
         LOCAL=\$(git rev-parse HEAD)
         REMOTE=\$(git rev-parse @{u})
+
         if [ "\$LOCAL" != "\$REMOTE" ]; then
-            log "Update detected. Pulling..."
+            log "Update detected (\$LOCAL -> \$REMOTE). Pulling..."
+            
+            # Attempt Pull
             if ! output=\$(git pull 2>&1); then
                 log "ERROR: Git pull failed. \$output"
             else
+                # Verify change happened
                 if [ "\$(git rev-parse HEAD)" != "\$LOCAL" ]; then
-                    log "Git updated. Re-installing..."
-                    [ -f "./setup.sh" ] && chmod +x ./setup.sh && ./setup.sh
-                    exec "\$0"
+                    log "Git updated successfully. Executing Setup..."
+                    
+                    # Execute Setup directly
+                    if [ -f "./setup.sh" ]; then
+                        chmod +x ./setup.sh
+                        # We run setup and capture its output to log
+                        ./setup.sh >> "\$LOG_FILE" 2>&1
+                        
+                        log "Setup complete. Exiting to allow systemd to restart cleanly on next cycle."
+                        exit 0
+                    else
+                        log "WARN: setup.sh not found after pull. Continuing with current version."
+                    fi
                 fi
             fi
         fi
     fi
 fi
 
-# Validation & Deployment
+# Validation & Deployment (Only reached if no update occurred)
 DRY_OUTPUT=\$("\$DSC_SCRIPT" --manifest "\$STATE_FILE" --dry-run 2>&1)
 EXIT_CODE=\$?
 
@@ -210,7 +225,7 @@ Persistent=false
 WantedBy=timers.target
 EOF
 
-# D) ISO Sync (New)
+# D) ISO Sync
 cat <<EOF > /etc/systemd/system/${SVC_ISO}.service
 [Unit]
 Description=Proxmox ISO State Reconciliation
@@ -241,7 +256,7 @@ systemctl enable --now ${SVC_HOST_UP}.timer
 systemctl enable --now ${SVC_LXC_UP}.timer
 systemctl enable --now ${SVC_ISO}.timer
 
-echo ">>> Installation Complete (v6.0)."
+echo ">>> Installation Complete (v6.1)."
 echo "    IaC Timer:         Every 2 minutes"
 echo "    LXC Update Timer:  Sunday 01:00"
 echo "    ISO Sync Timer:    Daily 02:00"
