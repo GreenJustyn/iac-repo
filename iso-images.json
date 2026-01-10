@@ -13,5 +13,15 @@
         "os": "Proxmox VE 8",
         "source_page": "https://enterprise.proxmox.com/iso/",
         "pattern": "proxmox-ve-8.[0-9]+-[0-9]+.iso"
+    },
+    {
+        "os": "Proxmox VE 9",
+        "source_page": "https://enterprise.proxmox.com/iso/",
+        "pattern": "proxmox-ve-9.[0-9]+-[0-9]+.iso"
+    },
+    {
+        "os": "Home Assistant Core",
+        "source_page": "https://github.com/home-assistant/operating-system/releases/download/[0-9].0.rc[0-9]/",
+        "pattern": "haos_ova-[0-9].0.rc[0-9].qcow2.xz"
     }
 ]
